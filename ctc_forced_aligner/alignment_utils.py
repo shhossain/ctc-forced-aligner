@@ -9,7 +9,7 @@ from packaging import version
 from transformers import AutoModelForCTC, AutoTokenizer
 from transformers import __version__ as transformers_version
 from transformers.utils import is_flash_attn_2_available
-from ._ctc_forced_align import forced_align
+from ._ctc_forced_align import forced_align as forced_align_cpp
 from typing import List
 
 SAMPLING_FREQ = 16000
