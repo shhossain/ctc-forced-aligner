@@ -199,5 +199,5 @@ std::tuple<py::array_t<int64_t>, py::array_t<float>> compute(
 }
 
 PYBIND11_MODULE(ctc_forced_aligner, m) {
-    m.def("forced_align_cpp", &compute, "Compute forced alignment with batch support.");
+    m.def("forced_align", &compute, "Compute forced alignment with batch support.");
 }
