@@ -188,12 +188,28 @@ def forced_align(
 
 import math
 
+import math
+import numpy as np
+import torch
+
 def get_alignments(
     emissions: torch.Tensor,
-    tokens_list: List[List[str]],
+    tokens_list: list,
     tokenizer,
     desired_T: int = 1000,  # Desired sequence length per batch
 ):
+    """
+    Align tokens to emissions using forced alignment.
+
+    Args:
+        emissions (torch.Tensor): Emissions tensor of shape [T_total, C] or [B, T, C].
+        tokens_list (List[List[str]]): List of token lists for each sequence in the batch.
+        tokenizer: Tokenizer object with get_vocab(), pad_token_id, unk_token_id.
+        desired_T (int, optional): Desired sequence length per batch. Defaults to 1000.
+
+    Returns:
+        Tuple[List, np.ndarray, str]: Segments list, scores array, and blank token.
+    """
     assert len(tokens_list) > 0, "Empty tokens_list"
     assert desired_T > 0, "desired_T must be a positive integer"
 
@@ -209,6 +225,8 @@ def get_alignments(
         raise ValueError("Emissions tensor must have 2 dimensions [T_total, C].")
 
     T_total, C = emissions.size()
+    device = emissions.device  # Get the device of emissions tensor
+
     # Automatically determine batch_size
     batch_size = math.ceil(T_total / desired_T)
     T = T_total // batch_size  # Integer division
@@ -222,7 +240,7 @@ def get_alignments(
     # Pad emissions if necessary
     padding = (batch_size * T) - T_total
     if padding > 0:
-        padding_tensor = torch.zeros(padding, C, dtype=emissions.dtype)
+        padding_tensor = torch.zeros(padding, C, dtype=emissions.dtype, device=device)
         emissions = torch.cat([emissions, padding_tensor], dim=0)
 
     emissions = emissions.view(batch_size, T, C)  # Shape: (batch_size, T, C)
@@ -253,13 +271,14 @@ def get_alignments(
 
     # Convert emissions to numpy
     if emissions.is_cuda:
-        emissions = emissions.cpu()
-    emissions_np = emissions.float().numpy()
+        emissions_np = emissions.cpu().float().numpy()
+    else:
+        emissions_np = emissions.float().numpy()
 
     # Input lengths
     input_lengths = np.full(B, T, dtype=np.int64)
-    if remainder != 0:
-        input_lengths[-1] = T - (padding)  # Adjust length for last batch
+    if padding > 0:
+        input_lengths[-1] = T - padding  # Adjust length for last batch
 
     # Call the batch-enabled forced_align function
     paths, scores = forced_align(
@@ -279,6 +298,7 @@ def get_alignments(
         segments_list.append(segments)
 
     return segments_list, scores, idx_to_token_map[blank_id]
+
 
 
 
