@@ -11,6 +11,7 @@ from transformers import __version__ as transformers_version
 from transformers.utils import is_flash_attn_2_available
 
 from .ctc_forced_aligner import forced_align as forced_align_cpp
+from typing import List
 
 SAMPLING_FREQ = 16000
 
@@ -153,7 +154,6 @@ def generate_emissions(
 
     return emissions, math.ceil(stride)
 
-
 def forced_align(
     log_probs: np.ndarray,
     targets: np.ndarray,
@@ -161,88 +161,108 @@ def forced_align(
     target_lengths: Optional[np.ndarray] = None,
     blank: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    r"""Align a CTC label sequence to an emission.
-    Args:
-        log_probs (NDArray): log probability of CTC emission output.
-            NDArray of shape `(B, T, C)`. where `B` is the batch size, `T` is the input length,
-            `C` is the number of characters in alphabet including blank.
-        targets (NDArray): Target sequence. NDArray of shape `(B, L)`,
-            where `L` is the target length.
-        input_lengths (NDArray or None, optional):
-            Lengths of the inputs (max value must each be <= `T`). 1-D NDArray of shape `(B,)`.
-        target_lengths (NDArray or None, optional):
-            Lengths of the targets. 1-D NDArray of shape `(B,)`.
-        blank_id (int, optional): The index of blank symbol in CTC emission. (Default: 0)
-
-    Returns:
-        Tuple(NDArray, NDArray):
-            NDArray: Label for each time step in the alignment path computed using forced alignment.
-
-            NDArray: Log probability scores of the labels for each time step.
-
-    Note:
-        The sequence length of `log_probs` must satisfy:
-
-
-        .. math::
-            L_{\text{log\_probs}} \ge L_{\text{label}} + N_{\text{repeat}}
-
-        where :math:`N_{\text{repeat}}` is the number of consecutively repeated tokens.
-        For example, in str `"aabbc"`, the number of repeats are `2`.
-
-    Note:
-        The current version only supports ``batch_size==1``.
-    """
     if blank in targets:
         raise ValueError(
-            f"targets Tensor shouldn't contain blank index. Found {targets}."
+            f"Targets shouldn't contain the blank index. Found {targets}."
         )
     if blank >= log_probs.shape[-1] or blank < 0:
-        raise ValueError("blank must be within [0, log_probs.shape[-1])")
-    if np.max(targets) >= log_probs.shape[-1] and np.min(targets) >= 0:
-        raise ValueError("targets values must be within [0, log_probs.shape[-1])")
+        raise ValueError("Blank index must be within [0, log_probs.shape[-1])")
+    if np.max(targets) >= log_probs.shape[-1] or np.min(targets) < 0:
+        raise ValueError("Target values must be within [0, log_probs.shape[-1])")
     assert log_probs.dtype == np.float32, "log_probs must be float32"
+
+    if input_lengths is None:
+        input_lengths = np.full(log_probs.shape[0], log_probs.shape[1], dtype=np.int64)
+    if target_lengths is None:
+        target_lengths = np.full(targets.shape[0], targets.shape[1], dtype=np.int64)
 
     paths, scores = forced_align_cpp(
         log_probs,
         targets,
+        input_lengths,
+        target_lengths,
         blank,
     )
+
     return paths, scores
+
+
 
 
 def get_alignments(
     emissions: torch.Tensor,
-    tokens: list,
+    tokens_list: List[List[str]],
     tokenizer,
+    batch_size: int = 1,
 ):
-    assert len(tokens) > 0, "Empty transcript"
+    assert len(tokens_list) > 0, "Empty tokens_list"
+    assert batch_size > 0, "batch_size must be a positive integer"
 
+    # Prepare the vocabulary
     dictionary = tokenizer.get_vocab()
     dictionary = {k.lower(): v for k, v in dictionary.items()}
     dictionary["<star>"] = len(dictionary)
-
-    # Force Alignment
-    token_indices = [
-        dictionary[c] for c in " ".join(tokens).split(" ") if c in dictionary
-    ]
-
     blank_id = dictionary.get("<blank>", tokenizer.pad_token_id)
+    idx_to_token_map = {v: k for k, v in dictionary.items()}
 
+    # Handle emissions tensor shape
+    if emissions.dim() == 2:
+        T_total, C = emissions.size()
+        # Calculate T (sequence length per batch)
+        T = T_total // batch_size
+        if T * batch_size != T_total:
+            raise ValueError("T_total must be divisible by batch_size")
+        emissions = emissions.view(batch_size, T, C)  # Shape: (batch_size, T, C)
+    elif emissions.dim() == 3:
+        batch_size_from_emissions = emissions.size(0)
+        if batch_size != batch_size_from_emissions:
+            raise ValueError("batch_size does not match the batch size of emissions")
+    else:
+        raise ValueError("Emissions tensor must have 2 or 3 dimensions.")
+
+    B = emissions.size(0)
+    assert B == batch_size, "Emissions batch size must match batch_size parameter"
+    assert B == len(tokens_list), "Emissions batch size must match tokens_list length"
+
+    # Prepare targets
+    max_L = max(len(tokens) for tokens in tokens_list)
+    targets = np.full((B, max_L), fill_value=tokenizer.pad_token_id, dtype=np.int64)
+    target_lengths = np.zeros(B, dtype=np.int64)
+
+    for i, tokens in enumerate(tokens_list):
+        token_indices = [
+            dictionary.get(c.lower(), tokenizer.unk_token_id) for c in tokens
+        ]
+        L = len(token_indices)
+        targets[i, :L] = token_indices
+        target_lengths[i] = L
+
+    # Convert emissions to numpy
     if emissions.is_cuda:
         emissions = emissions.cpu()
-    targets = np.asarray([token_indices], dtype=np.int64)
+    emissions_np = emissions.float().numpy()
 
-    path, scores = forced_align(
-        emissions.unsqueeze(0).float().numpy(),
+    # Input lengths
+    input_lengths = np.full(B, emissions_np.shape[1], dtype=np.int64)
+
+    # Call the batch-enabled forced_align function
+    paths, scores = forced_align(
+        emissions_np,
         targets,
+        input_lengths=input_lengths,
+        target_lengths=target_lengths,
         blank=blank_id,
     )
-    path = path.squeeze().tolist()
 
-    idx_to_token_map = {v: k for k, v in dictionary.items()}
-    segments = merge_repeats(path, idx_to_token_map)
-    return segments, scores, idx_to_token_map[blank_id]
+    # Process the outputs
+    segments_list = []
+    for i in range(B):
+        path = paths[i, :input_lengths[i]].tolist()
+        segments = merge_repeats(path, idx_to_token_map)
+        segments_list.append(segments)
+
+    return segments_list, scores, idx_to_token_map[blank_id]
+
 
 
 def load_alignment_model(
