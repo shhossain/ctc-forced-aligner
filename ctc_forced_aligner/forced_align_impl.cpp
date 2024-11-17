@@ -198,6 +198,7 @@ std::tuple<py::array_t<int64_t>, py::array_t<float>> compute(
     return std::make_tuple(paths, scores);
 }
 
-PYBIND11_MODULE(ctc_forced_aligner, m) {
+PYBIND11_MODULE(_ctc_forced_align, m) {
     m.def("forced_align", &compute, "Compute forced alignment with batch support.");
 }
+
