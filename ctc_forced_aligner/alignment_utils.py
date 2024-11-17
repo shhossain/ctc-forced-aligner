@@ -187,16 +187,16 @@ def forced_align(
     return paths, scores
 
 
-
+import math
 
 def get_alignments(
     emissions: torch.Tensor,
     tokens_list: List[List[str]],
     tokenizer,
-    batch_size: int = 1,
+    desired_T: int = 1000,  # Desired sequence length per batch
 ):
     assert len(tokens_list) > 0, "Empty tokens_list"
-    assert batch_size > 0, "batch_size must be a positive integer"
+    assert desired_T > 0, "desired_T must be a positive integer"
 
     # Prepare the vocabulary
     dictionary = tokenizer.get_vocab()
@@ -206,23 +206,38 @@ def get_alignments(
     idx_to_token_map = {v: k for k, v in dictionary.items()}
 
     # Handle emissions tensor shape
-    if emissions.dim() == 2:
-        T_total, C = emissions.size()
-        # Calculate T (sequence length per batch)
-        T = T_total // batch_size
-        if T * batch_size != T_total:
-            raise ValueError("T_total must be divisible by batch_size")
-        emissions = emissions.view(batch_size, T, C)  # Shape: (batch_size, T, C)
-    elif emissions.dim() == 3:
-        batch_size_from_emissions = emissions.size(0)
-        if batch_size != batch_size_from_emissions:
-            raise ValueError("batch_size does not match the batch size of emissions")
-    else:
-        raise ValueError("Emissions tensor must have 2 or 3 dimensions.")
+    if emissions.dim() != 2:
+        raise ValueError("Emissions tensor must have 2 dimensions [T_total, C].")
+
+    T_total, C = emissions.size()
+    # Automatically determine batch_size
+    batch_size = math.ceil(T_total / desired_T)
+    T = T_total // batch_size  # Integer division
+
+    # Adjust T and batch_size if necessary
+    remainder = T_total % batch_size
+    if remainder != 0:
+        T += 1  # Increase T to cover all time steps
+
+    # Reshape emissions
+    # Pad emissions if necessary
+    padding = (batch_size * T) - T_total
+    if padding > 0:
+        padding_tensor = torch.zeros(padding, C, dtype=emissions.dtype)
+        emissions = torch.cat([emissions, padding_tensor], dim=0)
+
+    emissions = emissions.view(batch_size, T, C)  # Shape: (batch_size, T, C)
+
+    # Prepare tokens_list
+    # If tokens_list has fewer entries than batch_size, pad it with empty lists
+    if len(tokens_list) < batch_size:
+        tokens_list += [[] for _ in range(batch_size - len(tokens_list))]
+    elif len(tokens_list) > batch_size:
+        # Truncate tokens_list to match batch_size
+        tokens_list = tokens_list[:batch_size]
 
     B = emissions.size(0)
-    assert B == batch_size, "Emissions batch size must match batch_size parameter"
-    assert B == len(tokens_list), "Emissions batch size must match tokens_list length"
+    assert B == batch_size, "Emissions batch size must match computed batch_size"
 
     # Prepare targets
     max_L = max(len(tokens) for tokens in tokens_list)
@@ -243,7 +258,9 @@ def get_alignments(
     emissions_np = emissions.float().numpy()
 
     # Input lengths
-    input_lengths = np.full(B, emissions_np.shape[1], dtype=np.int64)
+    input_lengths = np.full(B, T, dtype=np.int64)
+    if remainder != 0:
+        input_lengths[-1] = T - (padding)  # Adjust length for last batch
 
     # Call the batch-enabled forced_align function
     paths, scores = forced_align(
@@ -257,11 +274,13 @@ def get_alignments(
     # Process the outputs
     segments_list = []
     for i in range(B):
-        path = paths[i, :input_lengths[i]].tolist()
+        path_length = input_lengths[i]
+        path = paths[i, :path_length].tolist()
         segments = merge_repeats(path, idx_to_token_map)
         segments_list.append(segments)
 
     return segments_list, scores, idx_to_token_map[blank_id]
+
 
 
 
